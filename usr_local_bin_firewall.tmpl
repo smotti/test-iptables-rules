@@ -1,0 +1,473 @@
+#!/bin/bash
+
+#
+# Credits go to Mark A.
+#
+# Usage:    firewall.sh [start|stop|restart]
+# Install:  Create log directory /var/log/firewall
+# Install:  Configure logging of firewall messages in /etc/rsyslog.conf.
+#           ```
+#           :msg, contains, "IPT:" -/var/log/firewall/firewall.log
+#           &~
+#           ```
+
+define_variables()
+{
+  SCRIPT="firewall"
+  IPT="/sbin/iptables"
+  [ -x "$IPT" ] || exit 1
+
+  ETH_IF="{{vars.firewall.sett.iface}}"
+  ETH_IP=$(ip -4 -o addr show dev $ETH_IF primary | awk '{print $4}' | cut -d / -f 1)
+
+  ALLOWED_LANS="{{vars.firewall.sett.lans}}"
+
+  INFLUXDB_PORT="8086"
+  OXPECKER_PORT="5000"
+  AYEAYE_PORT="4000"
+  SYSLOG_PORT="5140"
+  POSTGRESQL_PORT="5432"
+
+  DHCP_IP="255.255.255.255"
+  DNS_IP="{{vars.firewall.sett.dns}}"
+  NTP_PORT="123"
+  SMTP_PORTS="25,465,587"
+  SMTP_IP="0.0.0.0/0"
+  SSH_PORT="22"
+
+  # Log 30 matching packets (when reached start at 0). Once this is exceeded, 
+  # apply the rate limit of 10 per minute. If this rate limit is exceeded,
+  # don't log until rate falls below the limit. Then increase the burst limit
+  # by 1 packert per minute so long as the rate limit is not exceeded. This
+  # prevents logs from filling too quickly during DoS attack.
+  DROP_LOG_LIMIT=" -m limit --limit-burst 30 --limit 10/minute "
+}
+
+
+clean_slate()
+{
+  echo "$SCRIPT: Flushing rules"
+  $IPT -F
+  echo "$SCRIPT: Deleting chains"
+  $IPT -X
+}
+
+
+configure_loopback()
+{
+  echo "$SCRIPT: Allow all loopback traffic."
+  $IPT -A INPUT -i lo -j ACCEPT
+  $IPT -A OUTPUT -o lo -j ACCEPT
+}
+
+
+block_at_chain_bottom()
+{
+  # Explicitly drop packets that have reached this point without being
+  # accepted by a prior rule. Although the default policy is 'DROP', this
+  # logs the fact that packets reaching this point are being dropped.
+  $IPT -A INPUT -j LOG --log-prefix "IPT: INPUT_CHAIN_BOTTOM " $DROP_LOG_LIMIT
+  $IPT -A INPUT -j DROP
+  $IPT -A OUTPUT -j LOG --log-prefix "IPT: OUTPUT_CHAIN_BOTTOM " $DROP_LOG_LIMIT
+  $IPT -A OUTPUT -j DROP
+}
+
+
+block_bad_source_inbound()
+{
+  echo "$SCRIPT: Blocking inbound packets with bad source addresses."
+
+  # Create a chain for filtering inbound packets with bad addresses.
+  # And direct any inbound packet for filtering to this chain.
+  $IPT -N BAD_ADDR
+  $IPT -A INPUT -j BAD_ADDR
+
+  # Do not block inbound packets from hosts on the "Allowed LANs".
+  echo "$SCRIPT: Don't block inbound packets form $ALLOWED_LANS."
+  $IPT -A BAD_ADDR -i $ETH_IF -s $ALLOWED_LANS -j RETURN
+
+  {{#classes.vagrant}}
+  $IPT -A BAD_ADDR -i eth0 -s 10.0.2.0/24 -j RETURN
+  {{/classes.vagrant}}
+
+  # Block any inbound packet supposedly from this host.
+  $IPT -A BAD_ADDR -s $ETH_IP -j LOG --log-prefix \
+    "IPT: INBOUND FROM SELF " $DROP_LOG_LIMIT
+  $IPT -A BAD_ADDR -s $ETH_IP -j DROP
+
+  # Block RFC 1918 private address space ranges.
+  $IPT -A BAD_ADDR -s 10.0.0.0/8,172.16.0.0/12,192.168.0.0/16 \
+    -j LOG --log-prefix "IPT: RFC 1918 ADDRESS " $DROP_LOG_LIMIT
+  $IPT -A BAD_ADDR -s 10.0.0.0/8,172.16.0.0/12,192.168.0.0/16 -j DROP
+
+  # Block zeroconf address range used primarily by hosts that use DHCP to
+  # acquire their IP addresses. An address from this range is assigned when
+  # these hosts can not find a DHCP server.
+  $IPT -A BAD_ADDR -s 169.254.0.0/16 -j LOG --log-prefix \
+    "IPT: 169.254.0.0/16 ADR " $DROP_LOG_LIMIT
+  $IPT -A BAD_ADDR -s 169.254.0.0/16 -j DROP
+
+  # Block TEST-NET address range used for test purposes.
+  $IPT -A BAD_ADDR -s 192.0.2.0/24 -j LOG --log-prefix \
+    "IPT: 192.0.2.0/24 ADDR " $DROP_LOG_LIMIT
+  $IPT -A BAD_ADDR -s 192.0.2.0/24 -j DROP
+
+  # Block RFC 3171 class d multicast range.
+  $IPT -A BAD_ADDR -s 224.0.0.0/4 -j LOG --log-prefix \
+    "IPT: 224.0.0.0/4 ADDR " $DROP_LOG_LIMIT
+  $IPT -A BAD_ADDR -s 224.0.0.0/4 -j DROP
+
+  # Block RFC 1700 class e entirely.
+  $IPT -A BAD_ADDR -s 240.0.0.0/4 -j LOG --log-prefix \
+    "IPT: 240.0.0.0/4 ADDR " $DROP_LOG_LIMIT
+  $IPT -A BAD_ADDR -s 240.0.0.0/4 -j DROP
+
+  # Block RFC 1700 loopback addresses.
+  $IPT -A BAD_ADDR -s 127.0.0.0/8 -j LOG --log-prefix \
+    "IPT: 127.0.0.0/8 ADDR " $DROP_LOG_LIMIT
+  $IPT -A BAD_ADDR -s 127.0.0.0/8 -j DROP
+
+  # Block RFC 2544 addresses set aside for performance testing.
+  $IPT -A BAD_ADDR -s 198.18.0.0/15 -j LOG --log-prefix \
+    "IPT: 198.18.0.0/5 ADDR " $DROP_LOG_LIMIT
+  $IPT -A BAD_ADDR -s 198.18.0.0/15 -j DROP
+}
+
+
+block_broadcasts()
+{
+  # Block limited broadcasts to the local network.
+  echo "$SCRIPT: Blocking inbound limited broadcasts."
+  $IPT -A BAD_ADDR -d 255.255.255.255 -j LOG --log-prefix \
+    "IPT: 255.255.255.255/32 " $DROP_LOG_LIMIT
+  $IPT -A BAD_ADDR -d 255.255.255.255 -j DROP
+}
+
+
+block_bad_states()
+{
+  echo "$SCRIPT: Blocking inbound packets with invalid state."
+  $IPT -A INPUT -m state --state INVALID -j LOG --log-prefix \
+    "IPT: INVALID STATE " $DROP_LOG_LIMIT
+  $IPT -A INPUT -m state --state INVALID -j DROP
+}
+
+
+block_fragments()
+{
+  # When using connection tracking (-m state) or NAT, the packets are
+  # reassembled before being received by filtering rules. If the kernel
+  # module for connection tracking is installed, fragements should not appear.
+  echo "$SCRIPT: Blocking inbound fragements."
+  $IPT -A INPUT -f -j LOG --log-prefix "IPT: FRAGMENT " $DROP_LOG_LIMIT
+  $IPT -A INPUT -f -j DROP
+}
+
+
+block_bad_flags()
+{
+  echo "$SCRIPT: Blocking inbound packets with bad TCP flags."
+  
+  # Create new chain and direct input TCP packets to it.
+  $IPT -N BAD_FLAGS
+  $IPT -A INPUT -p tcp -j BAD_FLAGS
+
+  # Block packets with all flags set.
+  $IPT -A BAD_FLAGS -p tcp --tcp-flags ALL ALL -j LOG \
+    --log-prefix "IPT: ALL TCP FLAGS " $DROP_LOG_LIMIT
+  $IPT -A BAD_FLAGS -p tcp --tcp-flags ALL ALL -j DROP
+
+  # Block Merry Xmas scans. (All but PSH flag set)
+  $IPT -A BAD_FLAGS -p tcp --tcp-flags ALL SYN,RST,ACK,FIN,URG -j LOG \
+    --log-prefix "IPT: ALL BUT PSH FLAGS " $DROP_LOG_LIMIT
+  $IPT -A BAD_FLAGS -p tcp --tcp-flags ALL SYN,RST,ACK,FIN,URG -j DROP
+
+  # Block Xmas scans.
+  $IPT -A BAD_FLAGS -p tcp --tcp-flags ALL FIN,URG,PSH -j LOG \
+    --log-prefix "IPT: FIN/URG/PSH TCP FLAGS " $DROP_LOG_LIMIT
+  $IPT -A BAD_FLAGS -p tcp --tcp-flags ALL FIN,URG,PSH -j DROP
+
+  # Block SYN/FIN packets used for stealthy scans.
+  $IPT -A BAD_FLAGS -p tcp --tcp-flags SYN,FIN SYN,FIN -j LOG \
+    --log-prefix "IPT: SYN/FIN TCP FLAGS " $DROP_LOG_LIMIT
+  $IPT -A BAD_FLAGS -p tcp --tcp-flags SYN,FIN SYN,FIN -j DROP
+
+  # Block SYN/RST packets used for stealthy scans.
+  $IPT -A BAD_FLAGS -p tcp --tcp-flags SYN,RST SYN,RST -j LOG \
+    --log-prefix "IPT: SYN/RST TCP FLAGS " $DROP_LOG_LIMIT
+  $IPT -A BAD_FLAGS -p tcp --tcp-flags SYN,RST SYN,RST -j DROP
+
+  # Block FIN only packets. Packet with FIN should have ACK too.
+  $IPT -A BAD_FLAGS -p tcp --tcp-flags ALL FIN -j LOG \
+    --log-prefix "IPT: ONLY FIN TCP FLAG " $DROP_LOG_LIMIT
+  $IPT -A BAD_FLAGS -p tcp --tcp-flags ALL FIN -j DROP
+
+  # Block null packets. There should be at least one flag set.
+  $IPT -A BAD_FLAGS -p tcp --tcp-flags ALL NONE -j LOG \
+    --log-prefix "IPT: NO TCP FLAGS SET " $DROP_LOG_LIMIT
+  $IPT -A BAD_FLAGS -p tcp --tcp-flags ALL NONE -j DROP
+
+  # Block ACK scans. A packet with state NEW should not have only ACK flag set.
+  # After SYN and SYN/ACK have been exchanged the connection is ESTABLISHED
+  # so an ACK is fine. ESTABLISHED seems to mean only that packets have flowed
+  # both ways, not that the TCP handshake is completed.
+  $IPT -A BAD_FLAGS -p tcp --tcp-flags ALL ACK -m state --state NEW \
+    -j LOG --log-prefix "IPT: NEW PKT ONLY ACK SET " $DROP_LOG_LIMIT
+  $IPT -A BAD_FLAGS -p tcp --tcp-flags ALL ACK -m state --state NEW -j DROP
+}
+
+
+allow_outbound_dhcp()
+{
+  echo "$SCRIPT: Allowing outbound DHCP via $ETH_IF at $DHCP_IP"
+  $IPT -A OUTPUT -o $ETH_IF -d "$DHCP_IP,$ALLOWED_LANS" -p udp --dport 67 \
+    --sport 68 -j ACCEPT
+  $IPT -A INPUT -i $ETH_IF -s $ALLOWED_LANS -p udp --sport 67 \
+    --dport 68 -j ACCEPT
+}
+
+
+allow_outbound_dns()
+{
+  echo "$SCRIPT: Allowing access to remote DNS servers at $DNS_IP"
+  $IPT -A OUTPUT -o $ETH_IF -s $ETH_IP -d $DNS_IP -p udp --dport 53 \
+    -m state --state NEW,ESTABLISHED -j ACCEPT
+  $IPT -A INPUT -i $ETH_IF -d $ETH_IP -s $DNS_IP -p udp --sport 53 \
+    -m state --state ESTABLISHED -j ACCEPT
+}
+
+
+allow_http()
+{
+  echo "$SCRIPT: Allowing inbound HTTP & HTTPS conncections from $ALLOWED_LANS."
+  $IPT -A INPUT -i $ETH_IF -d $ETH_IP -s $ALLOWED_LANS -p tcp -m multiport \
+    --dports 80,443 -m state --state NEW,ESTABLISHED -j ACCEPT
+  $IPT -A OUTPUT -o $ETH_IF -s $ETH_IP -d $ALLOWED_LANS -p tcp -m multiport \
+    --sports 80,443 -m state --state ESTABLISHED -j ACCEPT
+
+  echo "$SCRIPT: Allowing outbound HTTP & HTTPS connections."
+  $IPT -A OUTPUT -o $ETH_IF -s $ETH_IP -d 0.0.0.0/0 -p tcp -m multiport \
+    --dports 80,443 -m state --state NEW,ESTABLISHED -j ACCEPT
+  $IPT -A INPUT -i $ETH_IF -d $ETH_IP -s 0.0.0.0/0 -p tcp -m multiport \
+    --sports 80,443 -m state --state ESTABLISHED -j ACCEPT
+}
+
+
+allow_icmp()
+{
+  # NOTE: Two-way ping is required because cetana needs to be able to ping
+  # other system components in the LAN.
+  
+  # Allow inbound & outbound ECHO_REQUEST.
+  echo "$SCRIPT: Allowing ICMP pings (inbound rate limited to 5/second)."
+  $IPT -A INPUT -i $ETH_IF -d $ETH_IP -p icmp --icmp-type 8 -m limit \
+    --limit 5/second -j ACCEPT
+  $IPT -A OUTPUT -o $ETH_IF -s $ETH_IP -d 0.0.0.0/0 -p icmp --icmp-type 8 \
+    -j ACCEPT
+
+  # If not accepted under the rate limit, then log and drop.
+  $IPT -A INPUT -i $ETH_IF -d $ETH_IP -p icmp --icmp-type 8 -j LOG \
+    --log-prefix "IPT: ICMP 8 Excessive " $DROP_LOG_LIMIT
+  $IPT -A INPUT -i $ETH_IF -d $ETH_IP -p icmp --icmp-type 8 -j DROP
+
+  # Allow responses to ping without limit (inbound & outbound).
+  $IPT -A INPUT -i $ETH_IF -d $ETH_IP -p icmp --icmp-type 0 -m state \
+    --state ESTABLISHED -j ACCEPT
+  $IPT -A OUTPUT -o $ETH_IF -s $ETH_IP -p icmp --icmp-type 0 -m state \
+    --state ESTABLISHED -j ACCEPT
+
+  # Allow inbound ICMP Type 3 Code 4 packets. If a packet with DF flag set in
+  # IP header is recevied the box must become aware that a smaller packet size
+  # is required for the path.
+  $IPT -A INPUT -i $ETH_IF -d $ETH_IP -p icmp --icmp-type 3/4 -j ACCEPT
+
+  # Explicitly DROP all other inbound ICMP traffic for security.
+  $IPT -A INPUT -p icmp -j LOG --log-prefix "IPT: ICMP_IN " $DROP_LOG_LIMIT
+  $IPT -A INPUT -p icmp -j DROP
+}
+
+
+allow_outbound_ntp()
+{
+  echo "$SCRIPT: Allowing outbound NTP to any address"
+  $IPT -A OUTPUT -o $ETH_IF -s $ETH_IP -d 0.0.0.0/0 -p udp --dport $NTP_PORT \
+    -m state --state NEW,ESTABLISHED -j ACCEPT
+  $IPT -A INPUT -i $ETH_IF -d $ETH_IP -s 0.0.0.0/0 -p udp --sport $NTP_PORT \
+    -m state --state ESTABLISHED -j ACCEPT
+}
+
+
+allow_outbound_smtp()
+{
+  echo "$SCRIPT: Allowing outbound SMTP to $SMTP_PORTS at $SMTP_IP"
+  $IPT -A OUTPUT -o $ETH_IF -s $ETH_IP -d $SMTP_IP -p tcp \
+    -m multiport --dports $SMTP_PORTS -m state --state NEW,ESTABLISHED -j ACCEPT
+  $IPT -A INPUT -i $ETH_IF -d $ETH_IP -s $SMTP_IP -p tcp \
+    -m multiport --sports $SMTP_PORTS -m state --state ESTABLISHED -j ACCEPT
+}
+
+
+allow_ssh()
+{
+  # NOTE: Outbound ssh connections are required in order for collectd to gather
+  # system stats about bluetooth routers (of the hippo system) in the LAN.
+
+  echo "$SCRIPT: Allowing outbound ssh connections to $ALLOWED_LANS"
+  $IPT -A OUTPUT -o $ETH_IF -s $ETH_IP -d $ALLOWED_LANS -p tcp --dport 22 \
+    -m state --state NEW,ESTABLISHED -j ACCEPT
+  $IPT -A INPUT -i $ETH_IF -d $ETH_IP -s $ALLOWED_LANS -p tcp --sport 22 \
+    -m state --state ESTABLISHED -j ACCEPT
+
+  # Create a chain to handle new SSH connections. A separate chain is used for
+  # easier integration with a port knocking daemon for additional security
+  # if desired in the future.
+  # NOTE: Attacker controlling N source IP's could make 3N SSH connection
+  #       attempts per minute. Thus, limiting new SSH connections to 3 attempts
+  #       per 60 seconds would not be effective against a large DDoS attack.
+  echo "$SCRIPT: Limiting inbound SSH to port $SSH_PORT to 3 new connections" \
+    "per 60s."
+  $IPT -N SSH_NEW
+  $IPT -A SSH_NEW -m recent --set --name SSH
+  $IPT -A SSH_NEW -m recent --update --seconds 60 --hitcount 4 --name SSH \
+    -j LOG --log-prefix "IPT: SSH high recent hits " $DROP_LOG_LIMIT
+  $IPT -A SSH_NEW -m recent --update --seconds 60 --hitcount 4 --name SSH \
+    -j DROP
+
+  # Direct NEW incoming SSH connection attempts to the SSH_NEW chain.
+  $IPT -A INPUT -i $ETH_IF -s $ALLOWED_LANS -d $ETH_IP -p tcp \
+    --dport $SSH_PORT -m state --state NEW -j SSH_NEW
+
+  {{#classes.vagrant}}
+  # Vagrant
+  $IPT -A INPUT -i eth0 -p tcp \
+    --dport $SSH_PORT -m state --state NEW -j ACCEPT
+  {{/classes.vagrant}}
+
+  # If packet was not DROPPED by SSH_NEW, then continue processing it.
+  $IPT -A INPUT -i $ETH_IF -s $ALLOWED_LANS -d $ETH_IP -p tcp \
+    --dport $SSH_PORT -m state --state NEW,ESTABLISHED -j ACCEPT
+  $IPT -A OUTPUT -o $ETH_IF -s $ETH_IP -d $ALLOWED_LANS -p tcp \
+    --sport $SSH_PORT -m state --state ESTABLISHED -j ACCEPT
+
+  {{#classes.vagrant}}
+  # Vagrant
+  $IPT -A INPUT -i eth0 -p tcp \
+    --dport $SSH_PORT -m state --state NEW,ESTABLISHED -j ACCEPT
+  $IPT -A OUTPUT -o eth0 -p tcp \
+    --sport $SSH_PORT -m state --state ESTABLISHED -j ACCEPT
+  {{/classes.vagrant}}
+}
+
+
+allow_syslog()
+{
+  echo "$SCRIPT: Allowing inbound syslog traffic on port $SYSLOG_PORT."
+  $IPT -A INPUT -i $ETH_IF -d $ETH_IP -s $ALLOWED_LANS -p udp \
+    --dport $SYSLOG_PORT -m state --state NEW,ESTABLISHED -j ACCEPT
+  $IPT -A OUTPUT -o $ETH_IF -d $ALLOWED_LANS -s $ETH_IP -p udp \
+    --sport $SYSLOG_PORT -m state --state ESTABLISHED -j ACCEPT
+}
+
+
+allow_postgresql()
+{
+  echo "$SCRIPT: Allowing inbound traffic to postgresql on port $POSTGRESQL_PORT."
+  $IPT -A INPUT -i $ETH_IF -d $ETH_IP -s $ALLOWED_LANS -p tcp \
+    --dport $POSTGRESQL_PORT -m state --state NEW,ESTABLISHED -j ACCEPT
+  $IPT -A OUTPUT -o $ETH_IF -d $ALLOWED_LANS -s $ETH_IP -p tcp \
+    --sport $POSTGRESQL_PORT -m state --state ESTABLISHED -j ACCEPT
+}
+
+
+dress_as_windows()
+{
+  # IDEA: Try to look like a Windows Server.
+
+  # NOTE: Port 3389 is the default Windows Remote Desktop Terminal Service port.
+  # NOTE: REJECT the packet, rather tahn DROP it, so attackers receive the
+  #       hint that we use Windows.
+
+  echo "$SCRIPT: Spoofing Windows Remote Desktop Terminal service RST on port 3389."
+  $IPT -A INPUT -p tcp --dport 3389 -j LOG \
+    --log-prefix "IPT: WIN PORT 3389 HIT " $DROP_LOG_LIMIT
+  $IPT -A INPUT -p tcp --dport 3389 -j REJECT --reject-with icmp-host-prohibited
+
+  # Allow outbound ICMP Type 3 Code 10 messages back. The rule is inserted
+  # at the top of the OUTPUT chain.
+  $IPT -I OUTPUT -o $ETH_IF -s $ETH_IP -p icmp --icmp-type 3/10 -j ACCEPT
+}
+
+
+set_default_policy()
+{
+  # Set defaults, note this could log you out of the system. Thus it's advised
+  # to do the following: ./firewall.sh restart; sleep 60; ./firewall.sh stop
+  $IPT -P INPUT DROP
+  $IPT -P OUTPUT DROP
+  $IPT -P FORWARD DROP
+}
+
+
+do_start()
+{
+  clean_slate
+  configure_loopback
+
+  dress_as_windows
+
+  block_bad_source_inbound
+  block_broadcasts
+  block_bad_states
+  block_fragments
+  block_bad_flags
+
+  allow_ssh
+  allow_outbound_dhcp
+  allow_outbound_dns
+  allow_http
+  allow_icmp
+  allow_outbound_ntp
+  allow_outbound_smtp
+
+  allow_syslog
+  allow_postgresql
+
+  block_at_chain_bottom
+  set_default_policy
+}
+
+
+do_stop()
+{
+  echo "$SCRIPT: Removing firewall rules ..."
+
+  $IPT -P INPUT ACCEPT
+  $IPT -P OUTPUT ACCEPT
+  $IPT -P FORWARD ACCEPT
+
+  $IPT -F
+
+  $IPT -X
+
+  echo "$SCRIPT: Firewall rules removed."
+}
+
+
+define_variables
+
+
+case "$1" in
+  start|"")
+    do_start
+    ;;
+  restart|reload|force-reload)
+    do_stop
+    do_start
+    ;;
+  stop)
+    do_stop
+    ;;
+  *)
+    echo "Usage: $0 [start|stop|restart]" >&2
+    exit 3
+esac
